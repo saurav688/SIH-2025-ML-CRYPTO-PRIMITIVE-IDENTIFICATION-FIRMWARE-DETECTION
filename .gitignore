@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# PyTorch models
+*.pt
+*.pth
+*.ckpt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data files (optional - uncomment if you want to exclude)
+# data/
+
+# Logs
+*.log
+
+# Environment variables
+.env
+.env.local
