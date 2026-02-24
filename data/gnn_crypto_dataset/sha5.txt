@@ -1,0 +1,243 @@
+import math
+import argparse
+import hashlib
+from collections import Counter
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+from torch_geometric.data import Data
+from torch_geometric.nn import GCNConv, global_mean_pool
+
+
+# ==========================
+#  Model definition
+# ==========================
+
+class GNNFirmwareClassifier(nn.Module):
+    """
+    Same model as in train_firmware_gnn.py
+
+    Node features: [entropy, size_norm, offset_norm, sus_flag] (4 dims)
+    Output: 2 classes -> 0 (clean), 1 (tampered)
+    """
+    def __init__(self, in_feats=4, hidden_dim=32, num_classes=2):
+        super().__init__()
+        self.conv1 = GCNConv(in_feats, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, hidden_dim)
+        self.lin = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, x, edge_index, batch):
+        x = self.conv1(x, edge_index)
+        x = torch.relu(x)
+        x = self.conv2(x, edge_index)
+        x = torch.relu(x)
+        x = global_mean_pool(x, batch)
+        out = self.lin(x)
+        return out
+
+
+# ==========================
+#  Helper functions
+# ==========================
+
+def sha256_file(path: Path) -> str:
+    """Compute SHA-256 hash of a file."""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def byte_entropy(chunk: bytes) -> float:
+    """Shannon entropy of a bytes chunk."""
+    if not chunk:
+        return 0.0
+    counts = Counter(chunk)
+    total = len(chunk)
+    ent = 0.0
+    for c in counts.values():
+        p = c / total
+        ent -= p * math.log2(p)
+    return ent
+
+
+def build_graph_from_firmware(path: Path, chunk_size: int = 1024) -> Data:
+    """
+    Convert one firmware .bin file into a PyG Data graph.
+    Node features: [entropy, size_norm, offset_norm, sus_flag]
+    Edges: sequential chain (undirected)
+    """
+    with path.open("rb") as f:
+        data_bytes = f.read()
+
+    firmware_size = len(data_bytes)
+
+    if firmware_size == 0:
+        # Dummy single-node graph if file is empty
+        x = torch.zeros((1, 4), dtype=torch.float)
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+        data = Data(x=x, edge_index=edge_index)
+        data.firmware_path = str(path)
+        data.firmware_sha256 = sha256_file(path)
+        return data
+
+    # --- Chunking ---
+    chunks = [
+        data_bytes[i: i + chunk_size]
+        for i in range(0, firmware_size, chunk_size)
+    ]
+    num_nodes = len(chunks)
+
+    # --- Node features ---
+    entropies = []
+    size_norms = []
+    offset_norms = []
+    sus_flags = []
+
+    max_fw_size_norm = float(max(firmware_size - 1, 1))
+    max_chunk_size = float(chunk_size)
+
+    for i, chunk in enumerate(chunks):
+        entropy = byte_entropy(chunk)              # ~[0,8]
+        size_norm = len(chunk) / max_chunk_size   # [0,1]
+        offset = i * chunk_size
+        offset_norm = offset / max_fw_size_norm   # [0,1]
+
+        # Simple suspicious heuristic: high entropy chunk
+        sus_flag = 1.0 if entropy > 6.8 else 0.0
+
+        entropies.append(entropy)
+        size_norms.append(size_norm)
+        offset_norms.append(offset_norm)
+        sus_flags.append(sus_flag)
+
+    x = torch.tensor(
+        list(zip(entropies, size_norms, offset_norms, sus_flags)),
+        dtype=torch.float,
+    )  # [num_nodes, 4]
+
+    # --- Edges: sequential chain (undirected) ---
+    if num_nodes > 1:
+        src = torch.arange(0, num_nodes - 1, dtype=torch.long)
+        dst = torch.arange(1, num_nodes, dtype=torch.long)
+        edge_index = torch.cat(
+            [torch.stack([src, dst], dim=0),
+             torch.stack([dst, src], dim=0)],
+            dim=1,
+        )
+    else:
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+
+    data = Data(
+        x=x,
+        edge_index=edge_index,
+    )
+    data.firmware_path = str(path)
+    data.firmware_sha256 = sha256_file(path)
+
+    return data
+
+
+# ==========================
+#  Inference
+# ==========================
+
+@torch.no_grad()
+def infer_single_firmware(
+    model_path: str,
+    firmware_path: str,
+    chunk_size: int = 1024,
+    hidden_dim: int = 32,
+):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 1) Build graph from firmware
+    fw_path = Path(firmware_path)
+    if not fw_path.is_file():
+        raise FileNotFoundError(f"Firmware file not found: {fw_path}")
+
+    graph = build_graph_from_firmware(fw_path, chunk_size=chunk_size)
+    x = graph.x
+    edge_index = graph.edge_index
+
+    # Batch tensor: all nodes belong to graph 0
+    batch = torch.zeros(x.size(0), dtype=torch.long)
+
+    # 2) Load model
+    model = GNNFirmwareClassifier(in_feats=4, hidden_dim=hidden_dim, num_classes=2)
+    state_dict = torch.load(model_path, map_location=device)
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+
+    # 3) Run inference
+    x = x.to(device)
+    edge_index = edge_index.to(device)
+    batch = batch.to(device)
+
+    logits = model(x, edge_index, batch)
+    probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+    pred_class = int(probs.argmax())
+    prob_clean = float(probs[0])
+    prob_tampered = float(probs[1])
+
+    # 4) Print result
+    print("========================================")
+    print(" Firmware GNN Inference Result")
+    print("========================================")
+    print(f"File        : {graph.firmware_path}")
+    print(f"SHA-256     : {graph.firmware_sha256}")
+    print(f"Chunks      : {x.size(0)}")
+    print("----------------------------------------")
+    if pred_class == 0:
+        print(f"Prediction  : CLEAN (class 0)")
+    else:
+        print(f"Prediction  : TAMPERED / MALICIOUS (class 1)")
+    print(f"P(clean)    : {prob_clean:.4f}")
+    print(f"P(tampered) : {prob_tampered:.4f}")
+    print("========================================")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Infer firmware cleanliness using trained GNN model."
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="gnn_firmware_light.pth",
+        help="Path to trained model .pth file",
+    )
+    parser.add_argument(
+        "--firmware",
+        type=str,
+        required=True,
+        help="Path to firmware .bin file for inference",
+    )
+    parser.add_argument(
+        "--chunk_size",
+        type=int,
+        default=1024,
+        help="Chunk size in bytes used for graph construction",
+    )
+    parser.add_argument(
+        "--hidden_dim",
+        type=int,
+        default=32,
+        help="Hidden dimension used in the trained model",
+    )
+
+    args = parser.parse_args()
+
+    infer_single_firmware(
+        model_path=args.model,
+        firmware_path=args.firmware,
+        chunk_size=args.chunk_size,
+        hidden_dim=args.hidden_dim,
+    )
+
+
+if __name__ == "__main__":
+    main()

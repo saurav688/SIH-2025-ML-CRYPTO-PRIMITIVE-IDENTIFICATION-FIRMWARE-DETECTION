@@ -1,0 +1,236 @@
+import math
+import hashlib
+from collections import Counter
+from pathlib import Path
+from typing import List, Tuple
+
+import torch
+from torch_geometric.data import Data
+
+
+# ==========================
+#  Hashing / Integrity
+# ==========================
+
+def sha256_file(path: Path) -> str:
+    """
+    Compute SHA-256 hash of a file.
+
+    Args:
+        path: Path to the file.
+
+    Returns:
+        Hex string of SHA-256 hash.
+    """
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# ==========================
+#  Byte-level helpers
+# ==========================
+
+def byte_entropy(chunk: bytes) -> float:
+    """
+    Shannon entropy of a bytes chunk.
+
+    Entropy ~0  -> very uniform / low randomness
+    Entropy ~8  -> very high randomness
+
+    Args:
+        chunk: Bytes sequence.
+
+    Returns:
+        Entropy value in bits.
+    """
+    if not chunk:
+        return 0.0
+    counts = Counter(chunk)
+    total = len(chunk)
+    ent = 0.0
+    for c in counts.values():
+        p = c / total
+        ent -= p * math.log2(p)
+    return ent
+
+
+def chunk_bytes(data_bytes: bytes, chunk_size: int) -> List[bytes]:
+    """
+    Split a byte string into fixed-size chunks.
+
+    Args:
+        data_bytes: Firmware bytes.
+        chunk_size: Chunk size in bytes.
+
+    Returns:
+        List of byte chunks.
+    """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be > 0")
+
+    return [
+        data_bytes[i:i + chunk_size]
+        for i in range(0, len(data_bytes), chunk_size)
+    ]
+
+
+# ==========================
+#  Graph construction
+# ==========================
+
+def build_node_features_from_chunks(
+    chunks: List[bytes],
+    firmware_size: int,
+    chunk_size: int,
+    entropy_threshold: float = 6.8,
+) -> torch.Tensor:
+    """
+    Build node feature matrix from firmware chunks.
+
+    Features per node:
+        [entropy, size_norm, offset_norm, sus_flag]
+
+    Args:
+        chunks: List of byte chunks.
+        firmware_size: Total firmware size in bytes.
+        chunk_size: Chunk size in bytes.
+        entropy_threshold: Threshold to mark a chunk as suspicious.
+
+    Returns:
+        x: Tensor of shape [num_nodes, 4]
+    """
+    num_nodes = len(chunks)
+    if num_nodes == 0:
+        return torch.zeros((0, 4), dtype=torch.float)
+
+    entropies = []
+    size_norms = []
+    offset_norms = []
+    sus_flags = []
+
+    max_fw_size_norm = float(max(firmware_size - 1, 1))
+    max_chunk_size = float(chunk_size)
+
+    for i, chunk in enumerate(chunks):
+        entropy = byte_entropy(chunk)             # ~[0,8]
+        size_norm = len(chunk) / max_chunk_size   # [0,1]
+        offset = i * chunk_size
+        offset_norm = offset / max_fw_size_norm   # [0,1]
+
+        sus_flag = 1.0 if entropy > entropy_threshold else 0.0
+
+        entropies.append(entropy)
+        size_norms.append(size_norm)
+        offset_norms.append(offset_norm)
+        sus_flags.append(sus_flag)
+
+    x = torch.tensor(
+        list(zip(entropies, size_norms, offset_norms, sus_flags)),
+        dtype=torch.float,
+    )  # [num_nodes, 4]
+
+    return x
+
+
+def build_sequential_edges(num_nodes: int, undirected: bool = True) -> torch.Tensor:
+    """
+    Build a simple chain graph: 0-1-2-...-(n-1).
+
+    Args:
+        num_nodes: Number of nodes in the graph.
+        undirected: If True, edges are bidirectional.
+
+    Returns:
+        edge_index: LongTensor [2, num_edges]
+    """
+    if num_nodes <= 1:
+        return torch.empty((2, 0), dtype=torch.long)
+
+    src = torch.arange(0, num_nodes - 1, dtype=torch.long)
+    dst = torch.arange(1, num_nodes, dtype=torch.long)
+
+    if undirected:
+        edge_index = torch.cat(
+            [torch.stack([src, dst], dim=0),
+             torch.stack([dst, src], dim=0)],
+            dim=1,
+        )
+    else:
+        edge_index = torch.stack([src, dst], dim=0)
+
+    return edge_index
+
+
+def build_graph_from_bytes(
+    data_bytes: bytes,
+    chunk_size: int = 1024,
+    entropy_threshold: float = 6.8,
+) -> Data:
+    """
+    Convert raw firmware bytes into a PyG Data graph.
+
+    Node features: [entropy, size_norm, offset_norm, sus_flag]
+    Edges: sequential chain between chunks.
+
+    Args:
+        data_bytes: Firmware bytes.
+        chunk_size: Chunk size in bytes.
+        entropy_threshold: Suspicion entropy threshold.
+
+    Returns:
+        PyG Data object with x and edge_index.
+    """
+    firmware_size = len(data_bytes)
+
+    if firmware_size == 0:
+        x = torch.zeros((1, 4), dtype=torch.float)
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+        return Data(x=x, edge_index=edge_index)
+
+    chunks = chunk_bytes(data_bytes, chunk_size)
+    x = build_node_features_from_chunks(
+        chunks,
+        firmware_size=firmware_size,
+        chunk_size=chunk_size,
+        entropy_threshold=entropy_threshold,
+    )
+    edge_index = build_sequential_edges(num_nodes=x.size(0), undirected=True)
+
+    return Data(x=x, edge_index=edge_index)
+
+
+def build_graph_from_file(
+    path: Path,
+    chunk_size: int = 1024,
+    entropy_threshold: float = 6.8,
+    include_meta: bool = True,
+) -> Data:
+    """
+    Convert a firmware file into a PyG Data graph with optional metadata.
+
+    Args:
+        path: Path to firmware file (.bin).
+        chunk_size: Chunk size in bytes.
+        entropy_threshold: Suspicious entropy threshold.
+        include_meta: If True, attach firmware_path and firmware_sha256.
+
+    Returns:
+        PyG Data object with x, edge_index, and optional metadata.
+    """
+    with path.open("rb") as f:
+        data_bytes = f.read()
+
+    data = build_graph_from_bytes(
+        data_bytes,
+        chunk_size=chunk_size,
+        entropy_threshold=entropy_threshold,
+    )
+
+    if include_meta:
+        data.firmware_path = str(path)
+        data.firmware_sha256 = sha256_file(path)
+
+    return data

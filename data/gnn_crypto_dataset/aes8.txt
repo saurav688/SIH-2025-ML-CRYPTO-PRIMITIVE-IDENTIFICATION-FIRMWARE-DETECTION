@@ -1,0 +1,150 @@
+import os
+import random
+import numpy as np
+
+# Path for the binary dataset file
+output_path = "/mnt/data/aes128_binary_dataset_v2.npz"
+
+NUM_GRAPHS = 200
+MIN_NODES_PER_ROUND = 3
+MAX_NODES_PER_ROUND = 6
+NUM_FEATURES = 8
+AES_LABEL = 1
+NUM_ROUNDS = 10
+
+# Binary feature semantics:
+# f0: bitwise heavy?
+# f1: table lookup / S-box?
+# f2: XOR heavy?
+# f3: shift/rotate heavy?
+# f4: GF(2^8) arithmetic?
+# f5: key schedule node?
+# f6: high-entropy constants?
+# f7: late round? (1 = round >= 8, else 0)
+
+OP_TEMPLATES = {
+    "SUBBYTES": np.array([1, 1, 0, 0, 0, 0, 1, 0], dtype=np.uint8),
+    "SHIFTROWS": np.array([0, 0, 0, 1, 0, 0, 0, 0], dtype=np.uint8),
+    "MIXCOLUMNS": np.array([1, 0, 1, 0, 1, 0, 1, 0], dtype=np.uint8),
+    "ADDROUNDKEY": np.array([0, 0, 1, 0, 0, 0, 1, 0], dtype=np.uint8),
+    "KEYSCHEDULE": np.array([1, 1, 1, 1, 1, 1, 1, 0], dtype=np.uint8),
+}
+
+def sample_aes_node_features(op_type, round_idx, flip_prob=0.1):
+    feats = OP_TEMPLATES[op_type].copy()
+    # f7 late-round flag (for non-key schedule)
+    if op_type != "KEYSCHEDULE":
+        feats[7] = 1 if round_idx >= (NUM_ROUNDS - 2) else 0
+    else:
+        feats[7] = 0
+
+    # random bit flips for variety
+    for i in range(NUM_FEATURES):
+        if random.random() < flip_prob:
+            feats[i] = 1 - feats[i]
+
+    return feats.astype(np.uint8)
+
+all_node_features = []
+all_edge_index = []
+graph_id_per_node = []
+graph_id_per_edge = []
+labels = []
+
+global_node_index = 0
+
+for g in range(NUM_GRAPHS):
+    node_indices_this_graph = []
+    round_nodes_global = []  # list of lists of global node indices per round
+
+    # key schedule nodes
+    ks_nodes = []
+    num_ks_nodes = random.randint(3, 8)
+    for _ in range(num_ks_nodes):
+        feats = sample_aes_node_features("KEYSCHEDULE", round_idx=-1)
+        all_node_features.append(feats)
+        graph_id_per_node.append(g)
+        ks_nodes.append(global_node_index)
+        node_indices_this_graph.append(global_node_index)
+        global_node_index += 1
+
+    # rounds
+    for r in range(NUM_ROUNDS):
+        round_nodes = []
+        num_nodes_this_round = random.randint(MIN_NODES_PER_ROUND, MAX_NODES_PER_ROUND)
+
+        ops_pool = ["SUBBYTES", "SHIFTROWS", "MIXCOLUMNS", "ADDROUNDKEY"]
+        while len(ops_pool) < num_nodes_this_round:
+            ops_pool.append(random.choice(["SUBBYTES", "MIXCOLUMNS", "ADDROUNDKEY"]))
+        random.shuffle(ops_pool)
+        ops_pool = ops_pool[:num_nodes_this_round]
+
+        for op in ops_pool:
+            feats = sample_aes_node_features(op, round_idx=r)
+            all_node_features.append(feats)
+            graph_id_per_node.append(g)
+            round_nodes.append(global_node_index)
+            node_indices_this_graph.append(global_node_index)
+            global_node_index += 1
+
+        round_nodes_global.append(round_nodes)
+
+    # edges: key schedule chain
+    for i in range(len(ks_nodes) - 1):
+        all_edge_index.append([ks_nodes[i], ks_nodes[i + 1]])
+        graph_id_per_edge.append(g)
+
+    # connect KS to first round
+    if ks_nodes and round_nodes_global:
+        for nid in round_nodes_global[0]:
+            all_edge_index.append([ks_nodes[-1], nid])
+            graph_id_per_edge.append(g)
+
+    # edges within rounds
+    for round_nodes in round_nodes_global:
+        if not round_nodes:
+            continue
+        for i in range(len(round_nodes) - 1):
+            all_edge_index.append([round_nodes[i], round_nodes[i + 1]])
+            graph_id_per_edge.append(g)
+        extra_edges = random.randint(1, max(1, len(round_nodes) // 2))
+        for _ in range(extra_edges):
+            s = random.choice(round_nodes)
+            d = random.choice(round_nodes)
+            if s != d:
+                all_edge_index.append([s, d])
+                graph_id_per_edge.append(g)
+
+    # edges between rounds
+    for r in range(len(round_nodes_global) - 1):
+        src_round = round_nodes_global[r]
+        dst_round = round_nodes_global[r + 1]
+        if not src_round or not dst_round:
+            continue
+        for _ in range(3):
+            s = random.choice(src_round)
+            d = random.choice(dst_round)
+            all_edge_index.append([s, d])
+            graph_id_per_edge.append(g)
+
+    labels.append(AES_LABEL)
+
+# Convert to arrays
+node_features_arr = np.stack(all_node_features, axis=0)  # [N, 8]
+edge_index_arr = np.array(all_edge_index, dtype=np.int64).T  # [2, E]
+graph_id_per_node_arr = np.array(graph_id_per_node, dtype=np.int64)
+graph_id_per_edge_arr = np.array(graph_id_per_edge, dtype=np.int64)
+labels_arr = np.array(labels, dtype=np.int64)
+
+# Save as a single binary .npz file
+np.savez(
+    output_path,
+    node_features=node_features_arr,
+    edge_index=edge_index_arr,
+    graph_id_per_node=graph_id_per_node_arr,
+    graph_id_per_edge=graph_id_per_edge_arr,
+    labels=labels_arr,
+    num_graphs=np.array([NUM_GRAPHS], dtype=np.int64)
+)
+
+output_path

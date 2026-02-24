@@ -1,0 +1,188 @@
+import os
+import random
+import numpy as np
+import torch
+from torch_geometric.data import Data, InMemoryDataset
+
+# ---------------------------
+# CONFIG
+# ---------------------------
+ROOT = "aes128_binary_dataset"
+os.makedirs(ROOT, exist_ok=True)
+
+NUM_GRAPHS = 200          # how many AES graphs
+MIN_NODES_PER_ROUND = 3
+MAX_NODES_PER_ROUND = 6
+NUM_FEATURES = 8
+
+AES_LABEL = 1             # class index for AES-128
+
+# ---------------------------
+# BINARY FEATURE SEMANTICS
+# ---------------------------
+# f0: bitwise heavy?
+# f1: table lookup / S-box?
+# f2: XOR heavy?
+# f3: shift/rotate heavy?
+# f4: GF(2^8) arithmetic?
+# f5: key schedule node?
+# f6: high-entropy constants?
+# f7: late round? (1 = round >= 8, else 0)
+
+OP_TEMPLATES = {
+    "SUBBYTES": np.array([1, 1, 0, 0, 0, 0, 1, 0], dtype=np.uint8),
+    "SHIFTROWS": np.array([0, 0, 0, 1, 0, 0, 0, 0], dtype=np.uint8),
+    "MIXCOLUMNS": np.array([1, 0, 1, 0, 1, 0, 1, 0], dtype=np.uint8),
+    "ADDROUNDKEY": np.array([0, 0, 1, 0, 0, 0, 1, 0], dtype=np.uint8),
+    "KEYSCHEDULE": np.array([1, 1, 1, 1, 1, 1, 1, 0], dtype=np.uint8),
+}
+
+
+def sample_aes_node_features(op_type, round_idx, num_rounds=10, flip_prob=0.1):
+    """
+    Create an 8-d binary feature vector for a node of given operation type.
+    We flip bits with small probability to add variation.
+    """
+    feats = OP_TEMPLATES[op_type].copy()
+
+    # f7 = late round flag
+    if op_type != "KEYSCHEDULE":
+        feats[7] = 1 if round_idx >= (num_rounds - 2) else 0  # last 2 rounds = 1
+    else:
+        feats[7] = 0  # key schedule: not a round
+
+    # Randomly flip bits a bit to avoid identical nodes
+    for i in range(NUM_FEATURES):
+        if random.random() < flip_prob:
+            feats[i] = 1 - feats[i]
+
+    return feats.astype(np.float32)  # PYG likes float features
+
+
+def generate_aes_graph(graph_id):
+    """
+    Generate one AES-128-like graph:
+      - optional key schedule chain
+      - 10 rounds with typical AES operations
+    Returns a torch_geometric Data object.
+    """
+    node_features = []
+    edge_index_list = []
+
+    node_id = 0
+    node_ids_per_round = []
+
+    NUM_ROUNDS = 10
+
+    # ---- Key schedule nodes ----
+    ks_nodes = []
+    num_ks_nodes = random.randint(3, 8)
+    for _ in range(num_ks_nodes):
+        feats = sample_aes_node_features("KEYSCHEDULE", round_idx=-1)
+        node_features.append(feats)
+        ks_nodes.append(node_id)
+        node_id += 1
+
+    # ---- Round nodes ----
+    for r in range(NUM_ROUNDS):
+        round_nodes = []
+        num_nodes_this_round = random.randint(
+            MIN_NODES_PER_ROUND, MAX_NODES_PER_ROUND
+        )
+
+        ops_pool = ["SUBBYTES", "SHIFTROWS", "MIXCOLUMNS", "ADDROUNDKEY"]
+        while len(ops_pool) < num_nodes_this_round:
+            ops_pool.append(random.choice(["SUBBYTES", "MIXCOLUMNS", "ADDROUNDKEY"]))
+        random.shuffle(ops_pool)
+        ops_pool = ops_pool[:num_nodes_this_round]
+
+        for op in ops_pool:
+            feats = sample_aes_node_features(op_type=op, round_idx=r)
+            node_features.append(feats)
+            round_nodes.append(node_id)
+            node_id += 1
+
+        node_ids_per_round.append(round_nodes)
+
+    # ---- Edges: key schedule chain ----
+    for i in range(len(ks_nodes) - 1):
+        edge_index_list.append([ks_nodes[i], ks_nodes[i + 1]])
+
+    # connect last key schedule node to first round
+    if ks_nodes and node_ids_per_round:
+        for nid in node_ids_per_round[0]:
+            edge_index_list.append([ks_nodes[-1], nid])
+
+    # ---- Edges: within rounds ----
+    for round_nodes in node_ids_per_round:
+        if not round_nodes:
+            continue
+        # chain
+        for i in range(len(round_nodes) - 1):
+            edge_index_list.append([round_nodes[i], round_nodes[i + 1]])
+        # extra intra-round edges
+        extra_edges = random.randint(1, max(1, len(round_nodes) // 2))
+        for _ in range(extra_edges):
+            s = random.choice(round_nodes)
+            d = random.choice(round_nodes)
+            if s != d:
+                edge_index_list.append([s, d])
+
+    # ---- Edges: between rounds ----
+    for r in range(len(node_ids_per_round) - 1):
+        src_round = node_ids_per_round[r]
+        dst_round = node_ids_per_round[r + 1]
+        if not src_round or not dst_round:
+            continue
+        for _ in range(3):
+            s = random.choice(src_round)
+            d = random.choice(dst_round)
+            edge_index_list.append([s, d])
+
+    # ---- Build Data object ----
+    x = torch.tensor(node_features, dtype=torch.float)  # shape [N, 8]
+    edge_index = torch.tensor(edge_index_list, dtype=torch.long).t().contiguous()
+    y = torch.tensor([AES_LABEL], dtype=torch.long)
+
+    data = Data(x=x, edge_index=edge_index, y=y)
+    data.graph_id = graph_id  # optional attribute
+    return data
+
+
+class AES128BinaryDataset(InMemoryDataset):
+    def __init__(self, root, transform=None, pre_transform=None, pre_filter=None):
+        self._num_graphs = NUM_GRAPHS
+        super().__init__(root, transform, pre_transform, pre_filter)
+        self.data, self.slices = torch.load(self.processed_paths[0])
+
+    @property
+    def raw_file_names(self):
+        # We generate everything in process(), so no raw files required
+        return []
+
+    @property
+    def processed_file_names(self):
+        return ["data.pt"]
+
+    def download(self):
+        # Nothing to download
+        pass
+
+    def process(self):
+        data_list = []
+
+        for g in range(NUM_GRAPHS):
+            data = generate_aes_graph(g)
+            data_list.append(data)
+
+        data, slices = self.collate(data_list)
+        torch.save((data, slices), self.processed_paths[0])
+
+
+# ---------------------------
+# RUN GENERATION
+# ---------------------------
+if __name__ == "__main__":
+    dataset = AES128BinaryDataset(root=ROOT)
+    print(f"Generated {len(dataset)} AES-128 binary graphs.")
+    print("Saved binary dataset at:", os.path.join(ROOT, "processed", "data.pt"))

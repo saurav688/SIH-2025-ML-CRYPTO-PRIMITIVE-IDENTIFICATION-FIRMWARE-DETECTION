@@ -1,0 +1,43 @@
+#include "rsa.h"
+
+RSA::RSA(){
+    srand (static_cast <unsigned> (time(0)));
+    generate_keys();
+}
+
+int RSA::get_private_key(){
+    return this->d;
+}
+
+std::vector<int> RSA::get_public_keys(){
+    std::vector<int> vec;
+    vec.push_back(this->n);
+    vec.push_back(this->e);
+    return vec;
+}
+
+std::vector<int> RSA::chy(std::string string){
+    std::vector<int> ret;
+    for(char letter : string){
+        int ascii = ord(letter);
+        int crip = pow(ascii, this->e);
+        crip = mod(crip, this->n);
+        ret.push_back(crip);
+        std::cout << letter<<" "<<crip << std::endl;
+    }
+    return ret;
+}
+
+std::string RSA::unchy(std::string){
+    
+}
+
+void RSA::generate_keys(){
+    this->p = generate_prime();
+    this->q = generate_prime();
+    this->n = p * q;
+    int y = totient(p);
+    int x = totient(q);
+    this->toti_n = x * y;
+    this->e = generate_e();
+    this->d = generate_private_key}
