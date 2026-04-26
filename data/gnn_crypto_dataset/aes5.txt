@@ -1,0 +1,227 @@
+# train_mixed_firmware_gnn.py
+
+import argparse
+
+import torch
+import torch.nn as nn
+from torch.utils.data import ConcatDataset
+
+from torch_geometric.loader import DataLoader
+from torch_geometric.nn import GCNConv, global_mean_pool
+
+from firmware_dataset_light import FirmwareLightDataset
+from aes_firmware_gnn_dataset import AESFirmwareGNNDataset
+
+
+class MixedGNNFirmwareClassifier(nn.Module):
+    """
+    3-layer GCN with dropout for firmware graph classification.
+
+    Node features: [entropy, size_norm, offset_norm, sus_flag] (4 dims)
+    Output: 2 classes -> 0 (clean), 1 (tampered/encrypted)
+    """
+    def __init__(self, in_feats=4, hidden_dim=64, num_classes=2, dropout=0.3):
+        super().__init__()
+        self.conv1 = GCNConv(in_feats, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, hidden_dim)
+        self.conv3 = GCNConv(hidden_dim, hidden_dim)
+        self.lin = nn.Linear(hidden_dim, num_classes)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, edge_index, batch):
+        # x: [N, in_feats], edge_index: [2, E], batch: [N]
+        x = self.conv1(x, edge_index)
+        x = torch.relu(x)
+        x = self.dropout(x)
+
+        x = self.conv2(x, edge_index)
+        x = torch.relu(x)
+        x = self.dropout(x)
+
+        x = self.conv3(x, edge_index)
+        x = torch.relu(x)
+
+        # graph-level pooling
+        x = global_mean_pool(x, batch)  # [num_graphs, hidden_dim]
+
+        out = self.lin(x)               # [num_graphs, num_classes]
+        return out
+
+
+def train_one_epoch(model, loader, optimizer, criterion, device):
+    model.train()
+    total_loss = 0.0
+
+    for batch in loader:
+        batch = batch.to(device)
+        optimizer.zero_grad()
+
+        out = model(batch.x, batch.edge_index, batch.batch)
+        loss = criterion(out, batch.y)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item() * batch.num_graphs
+
+    avg_loss = total_loss / len(loader.dataset)
+    return avg_loss
+
+
+@torch.no_grad()
+def eval_model(model, loader, device):
+    model.eval()
+    correct = 0
+    total = 0
+
+    for batch in loader:
+        batch = batch.to(device)
+        out = model(batch.x, batch.edge_index, batch.batch)
+        preds = out.argmax(dim=1)
+        correct += (preds == batch.y).sum().item()
+        total += batch.num_graphs
+
+    acc = correct / total if total > 0 else 0.0
+    return acc
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Train GNN on mixed dataset (synthetic + AES-based firmware)."
+    )
+    parser.add_argument(
+        "--root_dir",
+        type=str,
+        default="data/firmware",
+        help="Root directory with clean/ (for AES dataset).",
+    )
+    parser.add_argument(
+        "--password",
+        type=str,
+        required=True,
+        help="Password used for deriving AES-128 key (for AES dataset).",
+    )
+    parser.add_argument(
+        "--num_synth_graphs",
+        type=int,
+        default=200,
+        help="Number of synthetic graphs from FirmwareLightDataset.",
+    )
+    parser.add_argument(
+        "--chunk_size",
+        type=int,
+        default=1024,
+        help="Chunk size in bytes for AES dataset graph construction.",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=16,
+        help="Batch size for training.",
+    )
+    parser.add_argument(
+        "--hidden_dim",
+        type=int,
+        default=64,
+        help="Hidden size in GNN layers.",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=30,
+        help="Number of training epochs.",
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=1e-3,
+        help="Learning rate.",
+    )
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.3,
+        help="Dropout rate.",
+    )
+    parser.add_argument(
+        "--model_out",
+        type=str,
+        default="gnn_firmware_mixed.pth",
+        help="Path to save best mixed-trained model.",
+    )
+
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[+] Using device: {device}")
+
+    # ============================
+    #  Datasets
+    # ============================
+    print("[+] Creating synthetic firmware dataset...")
+    synth_dataset = FirmwareLightDataset(num_graphs=args.num_synth_graphs)
+
+    print("[+] Creating AES-based real firmware dataset...")
+    aes_dataset = AESFirmwareGNNDataset(
+        root_dir=args.root_dir,
+        password=args.password,
+        chunk_size=args.chunk_size,
+    )
+
+    # Concatenate both datasets
+    mixed_dataset = ConcatDataset([synth_dataset, aes_dataset])
+
+    print(f"[+] Mixed dataset size: {len(mixed_dataset)} graphs")
+
+    # simple 80/20 train-test split
+    train_size = int(0.8 * len(mixed_dataset))
+    test_size = len(mixed_dataset) - train_size
+    train_dataset = torch.utils.data.Subset(mixed_dataset, range(train_size))
+    test_dataset = torch.utils.data.Subset(mixed_dataset, range(train_size, len(mixed_dataset)))
+
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size)
+
+    print(f"[+] Train graphs: {len(train_dataset)}, Test graphs: {len(test_dataset)}")
+
+    # ============================
+    #  Model / Optimizer / Loss
+    # ============================
+    model = MixedGNNFirmwareClassifier(
+        in_feats=4,
+        hidden_dim=args.hidden_dim,
+        num_classes=2,
+        dropout=args.dropout,
+    ).to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    criterion = nn.CrossEntropyLoss()
+
+    best_acc = 0.0
+    best_state = None
+
+    # ============================
+    #  Training loop
+    # ============================
+    for epoch in range(1, args.epochs + 1):
+        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
+        test_acc = eval_model(model, test_loader, device)
+
+        if test_acc > best_acc:
+            best_acc = test_acc
+            best_state = model.state_dict()
+
+        print(f"Epoch {epoch:02d} | Train Loss: {train_loss:.4f} | Test Acc: {test_acc:.4f}")
+
+    # ============================
+    #  Save best model
+    # ============================
+    if best_state is not None:
+        torch.save(best_state, args.model_out)
+        print(f"[+] Best mixed-trained model saved to {args.model_out} "
+              f"with test acc={best_acc:.4f}")
+    else:
+        print("[!] No model state to save. Check datasets.")
+
+
+if __name__ == "__main__":
+    main()

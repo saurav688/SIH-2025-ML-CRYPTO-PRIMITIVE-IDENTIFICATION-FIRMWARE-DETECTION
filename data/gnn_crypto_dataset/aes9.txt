@@ -1,0 +1,103 @@
+// aes_firmware_secure.c
+// Example firmware-style AES-128-CBC encryption for config data
+
+#include <stdint.h>
+#include <string.h>
+#include <stdio.h>
+#include <openssl/aes.h>
+
+#define CONFIG_BLOCK_SIZE  16   // AES block size
+#define MAX_CONFIG_SIZE    256  // example max config size
+
+static const uint8_t DEFAULT_AES_KEY[16] = {
+    0x2A, 0x7C, 0x91, 0x13,
+    0x44, 0x55, 0x66, 0x77,
+    0x88, 0x99, 0xAB, 0xCD,
+    0xEF, 0x01, 0x23, 0x45
+};
+
+static uint8_t iv_seed[CONFIG_BLOCK_SIZE] = {
+    0x10, 0x22, 0x33, 0x44,
+    0x55, 0x66, 0x77, 0x88,
+    0x99, 0xAA, 0xBB, 0xCC,
+    0xDD, 0xEE, 0xFF, 0x01
+};
+
+// Simple XOR-based IV update to avoid reusing the same IV exactly.
+// (Not perfect crypto practice, but good enough for demo firmware code.)
+static void update_iv(uint8_t *iv, uint32_t counter) {
+    for (int i = 0; i < CONFIG_BLOCK_SIZE; ++i) {
+        iv[i] = iv_seed[i] ^ (uint8_t)(counter * 31u + i);
+    }
+}
+
+// PKCS#7 padding for AES block size
+static uint32_t pad_config(uint8_t *buffer, uint32_t len) {
+    uint8_t pad = (uint8_t)(CONFIG_BLOCK_SIZE - (len % CONFIG_BLOCK_SIZE));
+    for (uint8_t i = 0; i < pad; ++i) {
+        buffer[len + i] = pad;
+    }
+    return len + pad;
+}
+
+// Encrypts an arbitrary configuration buffer using AES-128-CBC.
+// The ciphertext overwrites the input buffer.
+int encrypt_config_aes128_cbc(uint8_t *config_data,
+                              uint32_t *config_len,
+                              const uint8_t *key,
+                              uint32_t session_id)
+{
+    if (*config_len == 0 || *config_len > MAX_CONFIG_SIZE) {
+        return -1; // invalid length
+    }
+
+    uint8_t iv[CONFIG_BLOCK_SIZE];
+    update_iv(iv, session_id);
+
+    AES_KEY aes_key;
+    if (AES_set_encrypt_key(key, 128, &aes_key) != 0) {
+        return -2; // key schedule error
+    }
+
+    // pad data to full blocks
+    uint32_t padded_len = pad_config(config_data, *config_len);
+
+    // perform AES-128-CBC encryption in-place
+    AES_cbc_encrypt(config_data,
+                    config_data,
+                    padded_len,
+                    &aes_key,
+                    iv,
+                    AES_ENCRYPT);
+
+    *config_len = padded_len;
+    return 0;
+}
+
+// Example main for testing (not used in firmware build)
+#ifdef TEST_AES_FIRMWARE
+int main(void) {
+    uint8_t config[MAX_CONFIG_SIZE] = "device_id=42;mode=secure;debug=0;";
+    uint32_t len = (uint32_t)strlen((char *)config);
+
+    printf("Original config (%u bytes): %s\n", len, config);
+
+    int status = encrypt_config_aes128_cbc(config,
+                                           &len,
+                                           DEFAULT_AES_KEY,
+                                           1234);
+
+    if (status != 0) {
+        printf("AES encryption failed with code %d\n", status);
+        return 1;
+    }
+
+    printf("Encrypted config (%u bytes):\n", len);
+    for (uint32_t i = 0; i < len; ++i) {
+        printf("%02X ", config[i]);
+    }
+    printf("\n");
+
+    return 0;
+}
+#endif

@@ -1,0 +1,153 @@
+# aes_utils.py
+
+from hashlib import sha256
+from typing import Tuple
+
+from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
+
+
+BLOCK_SIZE = 16  # AES block size (128 bits)
+
+
+# ========== Key Derivation ==========
+
+def derive_aes128_key_from_password(password: str) -> bytes:
+    """
+    Derive a 128-bit AES key from a password using SHA-256 (first 16 bytes).
+
+    Args:
+        password: Any text password or passphrase.
+
+    Returns:
+        16-byte AES key.
+    """
+    h = sha256(password.encode("utf-8")).digest()
+    return h[:16]  # 128-bit key
+
+
+# ========== Padding Helpers (PKCS7) ==========
+
+def pkcs7_pad(data: bytes, block_size: int = BLOCK_SIZE) -> bytes:
+    """
+    Apply PKCS7 padding to data.
+    """
+    pad_len = block_size - (len(data) % block_size)
+    return data + bytes([pad_len] * pad_len)
+
+
+def pkcs7_unpad(data: bytes, block_size: int = BLOCK_SIZE) -> bytes:
+    """
+    Remove PKCS7 padding.
+    """
+    if not data:
+        raise ValueError("Cannot unpad empty data")
+
+    pad_len = data[-1]
+    if pad_len <= 0 or pad_len > block_size:
+        raise ValueError("Invalid padding length")
+
+    if data[-pad_len:] != bytes([pad_len] * pad_len):
+        raise ValueError("Invalid PKCS7 padding")
+
+    return data[:-pad_len]
+
+
+# ========== AES-128 CBC (bytes-level) ==========
+
+def aes128_encrypt_bytes(plaintext: bytes, key: bytes) -> Tuple[bytes, bytes]:
+    """
+    Encrypt plaintext bytes with AES-128-CBC.
+
+    Args:
+        plaintext: Plain bytes to encrypt.
+        key: 16-byte AES key (128-bit).
+
+    Returns:
+        (iv, ciphertext)
+    """
+    if len(key) != 16:
+        raise ValueError("AES-128 key must be 16 bytes")
+
+    iv = get_random_bytes(BLOCK_SIZE)
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    padded = pkcs7_pad(plaintext, BLOCK_SIZE)
+    ciphertext = cipher.encrypt(padded)
+    return iv, ciphertext
+
+
+def aes128_decrypt_bytes(iv: bytes, ciphertext: bytes, key: bytes) -> bytes:
+    """
+    Decrypt ciphertext bytes with AES-128-CBC.
+
+    Args:
+        iv: Initialization vector (16 bytes).
+        ciphertext: Encrypted bytes.
+        key: 16-byte AES key.
+
+    Returns:
+        Decrypted plaintext bytes.
+    """
+    if len(key) != 16:
+        raise ValueError("AES-128 key must be 16 bytes")
+    if len(iv) != BLOCK_SIZE:
+        raise ValueError("IV must be 16 bytes")
+
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    padded = cipher.decrypt(ciphertext)
+    plaintext = pkcs7_unpad(padded, BLOCK_SIZE)
+    return plaintext
+
+
+# ========== AES-128 CBC (file-level) ==========
+
+def aes128_encrypt_file(
+    input_path: str,
+    output_path: str,
+    password: str,
+) -> None:
+    """
+    Encrypt a file with AES-128-CBC and write:
+        [ IV (16 bytes) | CIPHERTEXT ... ]
+
+    Args:
+        input_path: Path to original file.
+        output_path: Path to write encrypted file.
+        password: Password to derive AES-128 key.
+    """
+    key = derive_aes128_key_from_password(password)
+
+    with open(input_path, "rb") as f:
+        plaintext = f.read()
+
+    iv, ciphertext = aes128_encrypt_bytes(plaintext, key)
+
+    with open(output_path, "wb") as f:
+        f.write(iv + ciphertext)
+
+
+def aes128_decrypt_file(
+    input_path: str,
+    output_path: str,
+    password: str,
+) -> None:
+    """
+    Decrypt a file produced by aes128_encrypt_file().
+    Expects:
+        [ IV (16 bytes) | CIPHERTEXT ... ]
+    """
+    key = derive_aes128_key_from_password(password)
+
+    with open(input_path, "rb") as f:
+        data = f.read()
+
+    if len(data) < BLOCK_SIZE:
+        raise ValueError("Encrypted file too small")
+
+    iv = data[:BLOCK_SIZE]
+    ciphertext = data[BLOCK_SIZE:]
+
+    plaintext = aes128_decrypt_bytes(iv, ciphertext, key)
+
+    with open(output_path, "wb") as f:
+        f.write(plaintext)

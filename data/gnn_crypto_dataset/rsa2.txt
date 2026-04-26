@@ -1,0 +1,92 @@
+import io
+from typing import Optional
+
+from elftools.elf.elffile import ELFFile
+from capstone import (
+    Cs, CS_ARCH_ARM, CS_MODE_ARM,
+    CS_ARCH_MIPS, CS_MODE_MIPS32, CS_MODE_BIG_ENDIAN, CS_MODE_LITTLE_ENDIAN,
+    CS_ARCH_X86, CS_MODE_32, CS_MODE_64,
+    CS_ARCH_RISCV, CS_MODE_RISCV32, CS_MODE_RISCV64,
+)
+
+# ELF e_machine mapping
+ELF_ARCH_MAP = {
+    0:  "No Machine",
+    3:  "x86 (Intel 80386)",
+    62: "x86-64",
+    40: "ARM (32-bit)",
+    183: "AArch64 (ARM 64-bit)",
+    8:  "MIPS",
+    243: "RISC-V",
+}
+
+
+def detect_arch_from_elf_bytes(data: bytes) -> Optional[str]:
+    """Try to parse ELF header from raw bytes and return architecture."""
+    if not data.startswith(b"\x7fELF"):
+        return None
+
+    bio = io.BytesIO(data)
+    try:
+        elf = ELFFile(bio)
+        machine = elf["e_machine"]
+        return ELF_ARCH_MAP.get(machine, f"Unknown ELF arch (e_machine={machine})")
+    except Exception:
+        return None
+
+
+def guess_arch_with_capstone(data: bytes) -> str:
+    """
+    Heuristic: disassemble first few KB with multiple architectures,
+    choose the one with most valid instructions.
+    """
+    sample = data[:4096]  # first 4 KB are usually enough
+
+    candidates = {
+        "ARM": Cs(CS_ARCH_ARM, CS_MODE_ARM),
+        "MIPS32-LE": Cs(CS_ARCH_MIPS, CS_MODE_MIPS32 | CS_MODE_LITTLE_ENDIAN),
+        "MIPS32-BE": Cs(CS_ARCH_MIPS, CS_MODE_MIPS32 | CS_MODE_BIG_ENDIAN),
+        "x86-32": Cs(CS_ARCH_X86, CS_MODE_32),
+        "x86-64": Cs(CS_ARCH_X86, CS_MODE_64),
+        "RISC-V32": Cs(CS_ARCH_RISCV, CS_MODE_RISCV32),
+        "RISC-V64": Cs(CS_ARCH_RISCV, CS_MODE_RISCV64),
+    }
+
+    scores = {}
+
+    for name, dis in candidates.items():
+        try:
+            count = 0
+            # disasm returns iterator of instructions
+            for _ in dis.disasm(sample, 0x0):
+                count += 1
+                if count > 200:  # enough signal
+                    break
+            scores[name] = count
+        except Exception:
+            scores[name] = 0
+
+    # choose best guess
+    best_arch = max(scores, key=scores.get)
+    best_score = scores[best_arch]
+
+    # thoda sanity check: bilkul hi zero hua to unknown bol do
+    if best_score == 0:
+        return "Unknown (could not disassemble reliably)"
+
+    return f"Guessed (non-ELF): {best_arch} (score={best_score})"
+
+
+def detect_firmware_architecture_from_bytes(data: bytes) -> str:
+    """
+    Main function:
+    - First try ELF-based detection
+    - If not ELF, fall back to heuristic disassembly-based guess
+    """
+    # 1. ELF detection
+    arch = detect_arch_from_elf_bytes(data)
+    if arch is not None:
+        return f"ELF detected → {arch}"
+
+    # 2. Heuristic for raw .bin
+    return guess_arch_with_capstone(data)

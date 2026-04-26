@@ -1,0 +1,226 @@
+# aes_multi_level_gnn_dataset.py
+
+from pathlib import Path
+from typing import List
+
+import torch
+from torch_geometric.data import Data, InMemoryDataset
+
+from aes_utils import derive_aes128_key_from_password, aes128_encrypt_bytes
+from firmware_utils import build_graph_from_bytes, sha256_file
+
+
+class AESMultiLevelGNNDataset(InMemoryDataset):
+    """
+    AES multi-level dataset for GNN training.
+
+    For each clean firmware in: root_dir/clean/*.bin
+
+    We create THREE graph samples:
+
+        1) CLEAN
+            - fw_bytes = original data
+            - y = 0
+            - encryption_level = "none"
+
+        2) FULL AES-ENCRYPTED
+            - fw_bytes = IV || CIPHERTEXT of entire file
+            - y = 1
+            - encryption_level = "full"
+
+        3) PARTIAL AES-ENCRYPTED
+            - fw_bytes = mixture:
+                * some chunks untouched (plaintext)
+                * some chunks AES-128-encrypted
+            - y = 2
+            - encryption_level = "partial"
+
+    This dataset is useful for a 3-class GNN:
+        0 -> clean
+        1 -> fully encrypted / strongly obfuscated
+        2 -> partially encrypted / stealthy tampering
+    """
+
+    def __init__(
+        self,
+        root_dir: str,
+        password: str,
+        chunk_size: int = 1024,
+        partial_encrypt_prob: float = 0.3,
+        transform=None,
+        pre_transform=None,
+    ):
+        """
+        Args:
+            root_dir: root directory with "clean/" subfolder containing .bin files.
+            password: password used to derive AES-128 key.
+            chunk_size: chunk size for graph construction.
+            partial_encrypt_prob: probability [0,1] of encrypting each chunk
+                                  in partial encryption mode.
+        """
+        self.root_dir = Path(root_dir)
+        self.clean_dir = self.root_dir / "clean"
+        self.chunk_size = chunk_size
+        self.partial_encrypt_prob = partial_encrypt_prob
+
+        # Derive AES key once
+        self.aes_key = derive_aes128_key_from_password(password)
+
+        super().__init__(str(self.root_dir), transform, pre_transform)
+        self.data, self.slices = self._build_dataset()
+
+    # ------------------------------------------------------------
+    # Helpers to iterate firmware
+    # ------------------------------------------------------------
+
+    def _iter_clean_firmware_files(self):
+        if not self.clean_dir.is_dir():
+            raise FileNotFoundError(f"Clean firmware directory not found: {self.clean_dir}")
+
+        for f in sorted(self.clean_dir.glob("*.bin")):
+            if f.is_file():
+                yield f
+
+    # ------------------------------------------------------------
+    # AES-based transformations
+    # ------------------------------------------------------------
+
+    def _encrypt_full(self, fw_bytes: bytes) -> bytes:
+        """
+        Fully encrypt entire firmware with AES-128-CBC.
+        Store format: IV || CIPHERTEXT
+        """
+        iv, ciphertext = aes128_encrypt_bytes(fw_bytes, self.aes_key)
+        return iv + ciphertext
+
+    def _encrypt_partial(self, fw_bytes: bytes) -> bytes:
+        """
+        Partially encrypt firmware:
+            - split into chunks of chunk_size
+            - with probability partial_encrypt_prob, encrypt the chunk
+              and replace it with (IV || CIPHERTEXT) of that chunk.
+            - other chunks remain plaintext.
+
+        Note: resulting firmware length will be different, but that's fine.
+        """
+        if not fw_bytes:
+            return fw_bytes
+
+        chunks: List[bytes] = [
+            fw_bytes[i : i + self.chunk_size]
+            for i in range(0, len(fw_bytes), self.chunk_size)
+        ]
+
+        new_chunks: List[bytes] = []
+        for chunk in chunks:
+            # Decide whether to encrypt this chunk
+            if torch.rand(1).item() < self.partial_encrypt_prob:
+                iv, ciphertext = aes128_encrypt_bytes(chunk, self.aes_key)
+                new_chunks.append(iv + ciphertext)
+            else:
+                new_chunks.append(chunk)
+
+        return b"".join(new_chunks)
+
+    # ------------------------------------------------------------
+    # Graph makers
+    # ------------------------------------------------------------
+
+    def _make_graph(
+        self,
+        fw_bytes: bytes,
+        idx: int,
+        path: Path,
+        label: int,
+        level: str,
+        original_sha: str,
+    ) -> Data:
+        """
+        Convert firmware bytes -> PyG graph and attach metadata.
+
+        Args:
+            fw_bytes: firmware bytes (clean or transformed).
+            idx: global index for this sample.
+            path: original firmware path.
+            label: class label (0,1,2).
+            level: "none" | "full" | "partial".
+            original_sha: SHA-256 of original clean firmware.
+        """
+        g = build_graph_from_bytes(
+            fw_bytes,
+            chunk_size=self.chunk_size,
+            entropy_threshold=6.8,
+        )
+
+        g.y = torch.tensor([label], dtype=torch.long)
+        g.firmware_idx = torch.tensor([idx])
+        g.firmware_path = str(path)
+        g.original_sha256 = original_sha
+        g.current_sha256 = sha256_file(path) if label == 0 else ""  # optional
+        g.encryption_level = level  # "none", "full", "partial"
+        g.is_encrypted = torch.tensor([1 if label in (1, 2) else 0], dtype=torch.long)
+
+        return g
+
+    # ------------------------------------------------------------
+    # Build dataset
+    # ------------------------------------------------------------
+
+    def _build_dataset(self):
+        data_list: List[Data] = []
+        idx = 0
+
+        for fw_path in self._iter_clean_firmware_files():
+            with fw_path.open("rb") as f:
+                clean_bytes = f.read()
+
+            if not clean_bytes:
+                # skip empty
+                continue
+
+            original_sha = sha256_file(fw_path)
+
+            # 1) CLEAN sample (label 0)
+            clean_graph = self._make_graph(
+                fw_bytes=clean_bytes,
+                idx=idx,
+                path=fw_path,
+                label=0,
+                level="none",
+                original_sha=original_sha,
+            )
+            data_list.append(clean_graph)
+            idx += 1
+
+            # 2) FULL AES-encrypted sample (label 1)
+            full_enc_bytes = self._encrypt_full(clean_bytes)
+            full_graph = self._make_graph(
+                fw_bytes=full_enc_bytes,
+                idx=idx,
+                path=fw_path,
+                label=1,
+                level="full",
+                original_sha=original_sha,
+            )
+            data_list.append(full_graph)
+            idx += 1
+
+            # 3) PARTIAL AES-encrypted sample (label 2)
+            partial_enc_bytes = self._encrypt_partial(clean_bytes)
+            partial_graph = self._make_graph(
+                fw_bytes=partial_enc_bytes,
+                idx=idx,
+                path=fw_path,
+                label=2,
+                level="partial",
+                original_sha=original_sha,
+            )
+            data_list.append(partial_graph)
+            idx += 1
+
+        if not data_list:
+            raise RuntimeError(
+                f"No .bin files found in clean firmware directory: {self.clean_dir}"
+            )
+
+        return self.collate(data_list)

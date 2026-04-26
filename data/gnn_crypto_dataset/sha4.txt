@@ -1,0 +1,198 @@
+import math
+import hashlib
+from collections import Counter
+from pathlib import Path
+
+import torch
+from torch_geometric.data import Data, InMemoryDataset
+
+
+def sha256_file(path: Path) -> str:
+    """Compute SHA-256 hash of a file."""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def byte_entropy(chunk: bytes) -> float:
+    """Shannon entropy of a bytes chunk."""
+    if not chunk:
+        return 0.0
+    counts = Counter(chunk)
+    total = len(chunk)
+    ent = 0.0
+    for c in counts.values():
+        p = c / total
+        ent -= p * math.log2(p)
+    return ent
+
+
+class FirmwareRealDataset(InMemoryDataset):
+    """
+    Real firmware dataset for GNN training.
+
+    Directory structure (example):
+
+        data/firmware/
+            clean/
+                fw1.bin
+                fw2.bin
+                ...
+            malicious/
+                fw3.bin
+                fw4.bin
+                ...
+
+    Each .bin file becomes ONE graph:
+        - Nodes: fixed-size chunks of bytes
+        - Node features: [entropy, size_norm, offset_norm, sus_flag]
+        - Edges: sequential (chain) edges between chunks
+        - Label y: 0 = clean, 1 = malicious/tampered
+        - Metadata: firmware_sha256, firmware_path
+    """
+
+    def __init__(
+        self,
+        root_dir: str,
+        chunk_size: int = 1024,
+        transform=None,
+        pre_transform=None,
+    ):
+        self.root_dir = Path(root_dir)
+        self.chunk_size = chunk_size
+
+        super().__init__(str(self.root_dir), transform, pre_transform)
+        self.data, self.slices = self._build_from_files()
+
+    def _iter_firmware_files(self):
+        """
+        Yield (path, label) pairs from directory structure.
+
+        Label convention:
+            - 'clean'     -> 0
+            - 'malicious' -> 1
+        """
+        label_map = {
+            "clean": 0,
+            "benign": 0,
+            "malicious": 1,
+            "tampered": 1,
+        }
+
+        for subdir in self.root_dir.iterdir():
+            if not subdir.is_dir():
+                continue
+            label_name = subdir.name.lower()
+            if label_name not in label_map:
+                # Skip unknown folders
+                continue
+
+            label = label_map[label_name]
+            for f in subdir.glob("*.bin"):
+                yield f, label
+
+    def _process_single_firmware(self, path: Path, label: int, idx: int) -> Data:
+        """
+        Convert one firmware .bin file into a PyG Data graph.
+        """
+        with path.open("rb") as f:
+            data_bytes = f.read()
+
+        firmware_size = len(data_bytes)
+        if firmware_size == 0:
+            # Skip empty files by making a dummy single-node graph
+            x = torch.zeros((1, 4), dtype=torch.float)
+            edge_index = torch.empty((2, 0), dtype=torch.long)
+            y = torch.tensor([label], dtype=torch.long)
+            d = Data(x=x, edge_index=edge_index, y=y)
+            d.firmware_idx = torch.tensor([idx])
+            d.firmware_path = str(path)
+            d.firmware_sha256 = sha256_file(path)
+            return d
+
+        # --- Chunking ---
+        chunk_size = self.chunk_size
+        chunks = [
+            data_bytes[i : i + chunk_size]
+            for i in range(0, firmware_size, chunk_size)
+        ]
+        num_nodes = len(chunks)
+
+        # --- Node features ---
+        entropies = []
+        size_norms = []
+        offset_norms = []
+        sus_flags = []
+
+        max_fw_size_norm = float(max(firmware_size - 1, 1))
+        max_chunk_size = float(chunk_size)
+
+        for i, chunk in enumerate(chunks):
+            entropy = byte_entropy(chunk)            # ~[0,8]
+            size_norm = len(chunk) / max_chunk_size  # [0,1]
+            offset = i * chunk_size
+            offset_norm = offset / max_fw_size_norm  # [0,1]
+
+            # Simple suspicious heuristic: high entropy chunk
+            sus_flag = 1.0 if entropy > 6.8 else 0.0
+
+            entropies.append(entropy)
+            size_norms.append(size_norm)
+            offset_norms.append(offset_norm)
+            sus_flags.append(sus_flag)
+
+        x = torch.tensor(
+            list(zip(entropies, size_norms, offset_norms, sus_flags)),
+            dtype=torch.float,
+        )  # [num_nodes, 4]
+
+        # --- Edges: sequential chain (undirected) ---
+        if num_nodes > 1:
+            src = torch.arange(0, num_nodes - 1, dtype=torch.long)
+            dst = torch.arange(1, num_nodes, dtype=torch.long)
+            edge_index = torch.cat(
+                [torch.stack([src, dst], dim=0),
+                 torch.stack([dst, src], dim=0)],
+                dim=1,
+            )
+        else:
+            edge_index = torch.empty((2, 0), dtype=torch.long)
+
+        # --- Label ---
+        y = torch.tensor([label], dtype=torch.long)
+
+        # --- Metadata ---
+        fw_sha256 = sha256_file(path)
+
+        data = Data(
+            x=x,
+            edge_index=edge_index,
+            y=y,
+        )
+        data.firmware_idx = torch.tensor([idx])
+        data.firmware_path = str(path)
+        data.firmware_sha256 = fw_sha256
+
+        return data
+
+    def _build_from_files(self):
+        """
+        Scan the firmware directory, build graphs, and collate.
+        """
+        data_list = []
+        idx = 0
+
+        for path, label in self._iter_firmware_files():
+            graph = self._process_single_firmware(path, label, idx)
+            data_list.append(graph)
+            idx += 1
+
+        if len(data_list) == 0:
+            raise RuntimeError(
+                f"No firmware .bin files found under {self.root_dir}. "
+                f"Expected structure: root/clean/*.bin and root/malicious/*.bin"
+            )
+
+        return self.collate(data_list)

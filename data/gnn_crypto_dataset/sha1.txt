@@ -1,0 +1,75 @@
+import torch
+from torch_geometric.data import Data, InMemoryDataset
+
+
+class FirmwareLightDataset(InMemoryDataset):
+    """
+    Lightweight synthetic dataset for GNN firmware experiments.
+
+    Each graph = one firmware
+    Nodes = chunks
+    Node features: [entropy, size_norm, offset_norm, sus_flag]
+    Label y: 0 (clean) or 1 (tampered)
+    """
+
+    def __init__(self, num_graphs=100, transform=None, pre_transform=None):
+        self.num_graphs = num_graphs
+        super().__init__('.', transform, pre_transform)
+        self.data, self.slices = self._generate_data()
+
+    def _generate_one_graph(self, idx: int) -> Data:
+        # 1) Decide number of chunks (nodes) for this firmware
+        num_nodes = torch.randint(low=4, high=16, size=(1,)).item()  # 4–15 chunks
+
+        # 2) Synthetic "firmware size" in bytes
+        firmware_size = torch.randint(low=8_192, high=65_536, size=(1,)).item()  # 8KB–64KB
+        chunk_size = firmware_size // num_nodes
+
+        # 3) Node features
+        # entropy in [3, 8] roughly
+        entropy = 3.0 + 5.0 * torch.rand(num_nodes)  # [3,8]
+        size_norm = torch.ones(num_nodes) * (chunk_size / 65_536.0)  # normalized to max 64KB
+        offsets = torch.arange(num_nodes) * chunk_size
+        offset_norm = offsets.float() / float(max(firmware_size - 1, 1))
+
+        # Simple suspicious flag: mark high-entropy chunks as suspicious
+        sus_flag = (entropy > 6.8).float()
+
+        # Stack into node feature matrix [num_nodes, 4]
+        x = torch.stack([entropy, size_norm, offset_norm, sus_flag], dim=1)
+
+        # 4) Edges: simple chain 0->1->2->...->(n-1)
+        if num_nodes > 1:
+            src = torch.arange(0, num_nodes - 1, dtype=torch.long)
+            dst = torch.arange(1, num_nodes, dtype=torch.long)
+            # Make edges undirected (optional but common in GNNs)
+            edge_index = torch.cat(
+                [torch.stack([src, dst], dim=0),
+                 torch.stack([dst, src], dim=0)],
+                dim=1
+            )
+        else:
+            edge_index = torch.empty((2, 0), dtype=torch.long)
+
+        # 5) Graph label: if enough suspicious chunks, mark as tampered
+        num_sus = int(sus_flag.sum().item())
+        # threshold: if >= 2 suspicious chunks, label as malicious
+        y = torch.tensor([1 if num_sus >= 2 else 0], dtype=torch.long)
+
+        # 6) Build PyG Data object
+        data = Data(
+            x=x,                    # [num_nodes, 4]
+            edge_index=edge_index,  # [2, num_edges]
+            y=y,                    # [1]
+            firmware_idx=torch.tensor([idx])  # just for debugging/trace
+        )
+
+        return data
+
+    def _generate_data(self):
+        data_list = []
+        for i in range(self.num_graphs):
+            g = self._generate_one_graph(i)
+            data_list.append(g)
+
+        return self.collate(data_list)
