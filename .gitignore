@@ -1,5 +1,31 @@
+# Virtual Environment
 venv/
+env/
+ENV/
+
+# Python cache
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+
+# Environment variables
 .env
+
+# ML / Large files
+*.pt
+*.pth
+*.h5
+
+# Data folders
+data/
+datasets/
+
+# Build / logs
+*.log
+dist/
+build/
+
+# OS files
+.DS_Store
+Thumbs.db
