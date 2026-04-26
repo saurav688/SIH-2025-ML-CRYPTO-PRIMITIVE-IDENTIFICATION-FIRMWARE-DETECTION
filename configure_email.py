@@ -51,7 +51,7 @@ EMAIL_USER={email}
 EMAIL_PASSWORD={app_password}
 
 # MongoDB Configuration
-MONGODB_URI=mongodb+srv://harsh9760verma_db_user:n2H9I0USOXordI5B@cluster0.rffbk5i.mongodb.net/
+MONGODB_URI=" "
 """
     
     with open('.env', 'w') as f:
