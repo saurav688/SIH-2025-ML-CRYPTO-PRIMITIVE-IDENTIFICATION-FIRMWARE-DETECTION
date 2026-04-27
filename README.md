@@ -63,26 +63,6 @@ Flask (API server)
 
 Git & GitHub
 
-🗂️ Project Structure
-AI-ML_Crypto_Primitive_Identification_in_Firmware/
-│
-├── ByteMeX_PS_ID_25239/
-│   ├── data/                     # Dataset files
-│   ├── loaders/                  # Data loading modules
-│   ├── models/                   # ML models
-│   ├── preprocessing/            # Preprocessing scripts
-│   ├── api_server.py             # Backend API
-│   ├── classify.py               # Classification logic
-│   ├── train.py                  # Model training
-│   ├── evaluate.py               # Model evaluation
-│   ├── predict_crypto.py         # Prediction script
-│   ├── utils.py                  # Utility functions
-│
-├── .gitignore
-├── requirements.txt
-├── start_server.bat
-├── README.md
-
 ⚙️ Installation & Setup
 1️⃣ Clone the Repository
 git clone https://github.com/saurav688/SIH-2025-ML-CRYPTO-PRIMITIVE-IDENTIFICATION-FIRMWARE-DETECTION/
